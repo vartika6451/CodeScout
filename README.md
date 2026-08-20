@@ -13,7 +13,7 @@ A Python backend built with FastAPI, designed to handle AI agent workflows, code
 *   **Entrypoint**: [`app/main.py`](file:///Users/vartikasharma/Documents/CodeScout/backend/app/main.py)
 *   **Routes**: 
     *   [`app/routes/health.py`](file:///Users/vartikasharma/Documents/CodeScout/backend/app/routes/health.py) (System health checks)
-    *   [`app/routes/anaylze.py`](file:///Users/vartikasharma/Documents/CodeScout/backend/app/routes/anaylze.py) (Repository analysis)
+    *   [`app/routes/analyze.py`](file:///Users/vartikasharma/Documents/CodeScout/backend/app/routes/analyze.py) (Repository analysis)
 *   **Modules** *(Placeholder directories for expansion)*:
     *   `app/agents/` — AI agent orchestration and task execution.
     *   `app/rag/` — Vector ingestion, embeddings, and context retrieval.
