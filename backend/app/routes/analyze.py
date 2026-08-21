@@ -8,6 +8,7 @@ from app.services.github_service import (
 )
 
 from app.services.file_filter import should_analyze_file
+from app.rag.chunker import chunk_code
 
 
 router = APIRouter()
@@ -20,7 +21,7 @@ class AnalyzeRequest(BaseModel):
 @router.post("/analyze")
 async def analyze_repository(request: AnalyzeRequest):
     try:
-        # Extract owner and repository name from GitHub URL
+        # Extract owner and repository name from the GitHub URL
         parts = request.repo_url.rstrip("/").split("/")
 
         owner = parts[-2]
@@ -29,7 +30,7 @@ async def analyze_repository(request: AnalyzeRequest):
         # Fetch repository information
         repository = await get_repository(owner, repo)
 
-        # Fetch repository file tree
+        # Fetch the complete repository file tree
         tree = await get_repository_tree(owner, repo)
 
         # Keep only files that are useful for code analysis
@@ -40,17 +41,16 @@ async def analyze_repository(request: AnalyzeRequest):
             and should_analyze_file(item["path"])
         ]
 
-        # Fetch the actual source code
-        source_files = []
+        # Fetch source code and split it into chunks
+        source_chunks = []
 
         for path in files:
             try:
                 content = await get_file_content(owner, repo, path)
 
-                source_files.append({
-                    "path": path,
-                    "content": content,
-                })
+                chunks = chunk_code(path, content)
+
+                source_chunks.extend(chunks)
 
             except Exception:
                 # Skip files that cannot be fetched
@@ -61,7 +61,9 @@ async def analyze_repository(request: AnalyzeRequest):
             "owner": repository["owner"]["login"],
             "language": repository["language"],
             "stars": repository["stargazers_count"],
-            "files": source_files,
+            "total_files": len(files),
+            "total_chunks": len(source_chunks),
+            "chunks": source_chunks,
         }
 
     except Exception as e:
