@@ -1,8 +1,13 @@
 from fastapi import FastAPI
-from app.routes.health import router as health_router
-from app.routes.analyze import router as analyze_router
 
-app = FastAPI(title="CodeScout API")
+from app.routes import health
+from app.routes import analyze
+from app.routes import chat
 
-app.include_router(health_router)
-app.include_router(analyze_router)
+
+app = FastAPI()
+
+
+app.include_router(health.router)
+app.include_router(analyze.router)
+app.include_router(chat.router)
