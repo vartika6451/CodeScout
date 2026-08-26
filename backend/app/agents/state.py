@@ -10,3 +10,7 @@ class CodeScoutState(TypedDict, total=False):
     context: str
 
     answer: str
+
+    needs_refinement: bool
+    refined_question: str
+    attempt_count: int

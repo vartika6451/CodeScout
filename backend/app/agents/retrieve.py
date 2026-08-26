@@ -9,8 +9,14 @@ def retrieve_node(state: CodeScoutState) -> CodeScoutState:
     Retrieve the most relevant code chunks for the user's question.
     """
 
-    question = state["question"]
+    question = state.get(
+    "refined_question",
+    state["question"]
+)
     repository = state["repository"]
+
+    # Increase retrieval attempt count
+    attempt_count = state.get("attempt_count", 0) + 1
 
     # Convert the question into an embedding
     query_embedding = create_embedding(question)
@@ -22,8 +28,8 @@ def retrieve_node(state: CodeScoutState) -> CodeScoutState:
         limit=5,
     )
 
-    # Store the results in the LangGraph state
     return {
         **state,
         "retrieved_chunks": results,
+        "attempt_count": attempt_count,
     }
