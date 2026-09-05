@@ -24,15 +24,18 @@ async def chat(request: ChatRequest):
         result = code_scout_graph.invoke(initial_state)
 
         return {
-            "answer": result["answer"],
+            "answer": result.get("answer", ""),
             "sources": [
                 {
-                    "file_path": chunk["file_path"],
-                    "chunk_index": chunk["chunk_index"],
-                    "similarity": chunk["similarity"],
+                    "file_path": chunk.get("file_path", ""),
+                    "chunk_index": chunk.get("chunk_index", 0),
+                    "similarity": round(float(chunk.get("similarity", 0)), 4),
+                    "content": chunk.get("content", ""),
                 }
-                for chunk in result["retrieved_chunks"]
+                for chunk in result.get("retrieved_chunks", [])
             ],
+            "refined_question": result.get("refined_question"),
+            "attempt_count": result.get("attempt_count", 1),
         }
 
     except Exception as e:
