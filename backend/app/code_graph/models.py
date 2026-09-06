@@ -1,5 +1,25 @@
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional
+
+
+class NodeType(str, Enum):
+    """Supported node categories in the CodeScout code graph."""
+
+    FILE = "FILE"
+    MODULE = "MODULE"
+    CLASS = "CLASS"
+    FUNCTION = "FUNCTION"
+    METHOD = "METHOD"
+
+
+class EdgeType(str, Enum):
+    """Supported directed relationship categories in the CodeScout code graph."""
+
+    DEFINES = "DEFINES"
+    CALLS = "CALLS"
+    INHERITS = "INHERITS"
+    IMPORTS = "IMPORTS"
 
 
 @dataclass
@@ -115,3 +135,37 @@ class RepositoryAnalysis:
             "function_calls_found": self.function_calls_found,
             "parse_failures": self.parse_failures_count,
         }
+
+
+@dataclass
+class Node:
+    """Represents a symbol or structural entity in the CodeScout code graph."""
+
+    id: str
+    name: str
+    type: NodeType
+    file_path: str
+    line_number: Optional[int] = None
+    end_line_number: Optional[int] = None
+    parent_id: Optional[str] = None
+    properties: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Edge:
+    """Represents a directed relationship between two nodes in the code graph."""
+
+    source_id: str
+    target_id: str
+    type: EdgeType
+    properties: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class UnresolvedCall:
+    """Records an unresolvable or ambiguous function call for telemetry and auditing."""
+
+    caller_id: str
+    call_name: str
+    reason: str  # e.g., 'external_or_missing', 'ambiguous'
+    candidates: List[str] = field(default_factory=list)
