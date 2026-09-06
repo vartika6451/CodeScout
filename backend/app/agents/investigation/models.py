@@ -40,7 +40,7 @@ class Hypothesis:
 
 @dataclass
 class BugInvestigationReport:
-    """Comprehensive, structured debugging report with runtime verification."""
+    """Comprehensive, structured debugging report with runtime verification and proposed patch."""
 
     summary: str
     likely_root_cause: str
@@ -55,6 +55,18 @@ class BugInvestigationReport:
     hypotheses: List[Dict[str, Any]] = field(default_factory=list)
     confirmed_hypotheses: List[str] = field(default_factory=list)
     rejected_hypotheses: List[str] = field(default_factory=list)
+
+    # Phase 4: Patch Generation & Verification Fields
+    patch_summary: Optional[str] = None
+    files_changed: List[str] = field(default_factory=list)
+    diff: Optional[str] = None
+    verification_status: str = "INCONCLUSIVE"  # 'FIX_VERIFIED', 'PATCH_PROPOSED', 'PATCH_FAILED', 'INCONCLUSIVE', 'PRE_EXISTING_FAILURES'
+    pre_existing_failures: List[str] = field(default_factory=list)
+    new_failures: List[str] = field(default_factory=list)
+    patch_iterations: int = 0
+    patch_history: List[Dict[str, Any]] = field(default_factory=list)
+    user_review_required: bool = True
+
     recommended_next_step: str = ""
     limitations: List[str] = field(default_factory=list)
 
@@ -88,6 +100,16 @@ class BugInvestigationState(TypedDict, total=False):
     test_count: int
     total_test_runtime: float
 
+    # Phase 4: Patching & Safe Verification state
+    proposed_patch: Optional[Dict[str, Any]]
+    patch_diff: Optional[str]
+    patch_history: List[Dict[str, Any]]
+    patch_iteration: int
+    max_patch_iterations: int
+    verification_result: Optional[Dict[str, Any]]
+    final_status: str
+    isolated_workspace_path: Optional[str]
+
     hypotheses: List[Dict[str, Any]]
     selected_hypothesis: Optional[Dict[str, Any]]
     confidence: str
@@ -97,4 +119,5 @@ class BugInvestigationState(TypedDict, total=False):
     is_conclusive: bool
 
     final_report: Dict[str, Any]
+
 

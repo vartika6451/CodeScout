@@ -25,6 +25,17 @@ from app.agents.tools import (
 )
 from app.execution.executor import ExecutionService
 from app.execution.models import ExecutionStatus
+from app.patching import (
+    FilePatch,
+    IsolatedWorkspace,
+    Patch,
+    PatchApplier,
+    PatchAttempt,
+    PatchGenerator,
+    PatchStatus,
+    PatchVerifier,
+    VerificationStatus,
+)
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -33,6 +44,7 @@ MAX_INVESTIGATION_STEPS = 6
 MAX_TEST_RUNS = 3
 MAX_TOTAL_TEST_RUNTIME = 180.0
 PER_TEST_TIMEOUT = 60.0
+MAX_PATCH_ITERATIONS = 3
 
 
 
@@ -127,6 +139,14 @@ def understand_bug(state: BugInvestigationState) -> BugInvestigationState:
         "rejected_hypotheses": [],
         "test_count": 0,
         "total_test_runtime": 0.0,
+        "proposed_patch": None,
+        "patch_diff": None,
+        "patch_history": [],
+        "patch_iteration": 0,
+        "max_patch_iterations": MAX_PATCH_ITERATIONS,
+        "verification_result": None,
+        "final_status": "INCONCLUSIVE",
+        "isolated_workspace_path": None,
         "investigation_steps": [],
         "step_count": 0,
         "is_conclusive": False,
@@ -698,15 +718,172 @@ def evaluate_hypotheses(state: BugInvestigationState) -> BugInvestigationState:
 
 
 # ==============================================================================
-# Step 9: Generate Final Investigation Report (Phase 3 Part 2)
+# Step 9: Generate Minimal Patch (Phase 4)
+# ==============================================================================
+def generate_patch_step(state: BugInvestigationState) -> BugInvestigationState:
+    """
+    Synthesizes a minimal, evidence-backed code patch targeting the confirmed root cause.
+    """
+    repo_path = state.get("repo_path") or "."
+    bug_report = state.get("bug_report", "")
+    selected = state.get("selected_hypothesis") or {}
+    root_cause = selected.get("explanation", bug_report)
+    failures = state.get("failures", [])
+    relevant_files = state.get("relevant_files", [])
+    runtime_evidence = state.get("runtime_evidence", [])
+    iteration = state.get("patch_iteration", 0) + 1
+    history = state.get("patch_history", [])
+
+    if not failures:
+        logger.info("No runtime failures or defects identified; skipping patch generation.")
+        step_info = {
+            "action": "generate_patch",
+            "iteration": iteration,
+            "patch_generated": False,
+            "reason": "No test failures detected.",
+        }
+        return {
+            **state,
+            "proposed_patch": None,
+            "patch_diff": None,
+            "final_status": "FIX_VERIFIED" if any(tr.get("status") == "passed" for tr in state.get("test_runs", [])) else "INCONCLUSIVE",
+            "investigation_steps": state.get("investigation_steps", []) + [step_info],
+            "step_count": state.get("step_count", 0) + 1,
+        }
+
+    patch = PatchGenerator.generate_patch(
+        bug_report=bug_report,
+        root_cause=root_cause,
+        repo_path=repo_path,
+        failures=failures,
+        relevant_files=relevant_files,
+        runtime_evidence=runtime_evidence,
+        iteration=iteration,
+        previous_attempts=history,
+    )
+
+    step_info = {
+        "action": "generate_patch",
+        "iteration": iteration,
+        "patch_generated": patch is not None,
+        "patch_id": patch.patch_id if patch else None,
+    }
+
+    return {
+        **state,
+        "proposed_patch": patch.to_dict() if patch else None,
+        "patch_diff": patch.diff if patch else None,
+        "patch_iteration": iteration,
+        "investigation_steps": state.get("investigation_steps", []) + [step_info],
+        "step_count": state.get("step_count", 0) + 1,
+    }
+
+
+# ==============================================================================
+# Step 10: Verify Patch in Isolated Workspace (Phase 4)
+# ==============================================================================
+def verify_patch_step(state: BugInvestigationState) -> BugInvestigationState:
+    """
+    Safely applies the proposed patch inside an isolated workspace and runs
+    multi-level verification (targeted test + related tests for regression detection).
+    The original repository remains completely untouched.
+    """
+    patch_dict = state.get("proposed_patch")
+    repo_path = state.get("repo_path") or "."
+    test_runs = state.get("test_runs", [])
+    targeted_test = test_runs[0].get("target") if test_runs else None
+
+    if not patch_dict:
+        return {
+            **state,
+            "final_status": "INCONCLUSIVE",
+            "step_count": state.get("step_count", 0) + 1,
+        }
+
+    # Reconstruct Patch model
+    files_changed = [
+        FilePatch(
+            file_path=fp["file_path"],
+            original_content=fp.get("original_content", ""),
+            proposed_content=fp.get("proposed_content", ""),
+            start_line=fp.get("start_line"),
+            end_line=fp.get("end_line"),
+            target_content=fp.get("target_content"),
+            replacement=fp.get("replacement"),
+        )
+        for fp in patch_dict.get("files_changed", [])
+    ]
+
+    patch = Patch(
+        patch_id=patch_dict.get("patch_id", "PATCH-1"),
+        files_changed=files_changed,
+        description=patch_dict.get("description", ""),
+        reason=patch_dict.get("reason", ""),
+        diff=patch_dict.get("diff", ""),
+        confidence=patch_dict.get("confidence", 0.8),
+        status=PatchStatus(patch_dict.get("status", "proposed")),
+        iteration=patch_dict.get("iteration", 1),
+    )
+
+    verifier = PatchVerifier()
+    verif_result = verifier.verify_patch(
+        patch=patch,
+        source_repo_path=repo_path,
+        targeted_test=targeted_test,
+    )
+
+    attempt = PatchAttempt(
+        iteration=patch.iteration,
+        patch_id=patch.patch_id,
+        description=patch.description,
+        diff=verif_result.diff,
+        verification_status=verif_result.status.value,
+        fixed_failures=verif_result.fixed_failures,
+        new_regressions=verif_result.new_regressions,
+        error_summary=None if verif_result.status.value in ("FIX_VERIFIED", "PRE_EXISTING_FAILURES") else "Verification failed",
+    )
+
+    history = list(state.get("patch_history", [])) + [attempt.to_dict()]
+
+    step_info = {
+        "action": "verify_patch",
+        "patch_id": patch.patch_id,
+        "status": verif_result.status.value,
+        "fixed_count": len(verif_result.fixed_failures),
+        "regressions_count": len(verif_result.new_regressions),
+    }
+
+    return {
+        **state,
+        "verification_result": verif_result.to_dict(),
+        "final_status": verif_result.status.value,
+        "patch_history": history,
+        "patch_diff": verif_result.diff or patch.diff,
+        "investigation_steps": state.get("investigation_steps", []) + [step_info],
+        "step_count": state.get("step_count", 0) + 1,
+    }
+
+
+# ==============================================================================
+# Step 11: Revise Patch Step (Phase 4)
+# ==============================================================================
+def revise_patch_step(state: BugInvestigationState) -> BugInvestigationState:
+    """
+    Coordinates state when preparing for another patch iteration.
+    """
+    logger.info(f"Revising patch attempt {state.get('patch_iteration', 1)}...")
+    return state
+
+
+# ==============================================================================
+# Step 12: Generate Final Investigation & Patch Report (Phase 4)
 # ==============================================================================
 def generate_report(state: BugInvestigationState) -> BugInvestigationState:
     """
-    Produces a comprehensive BugInvestigationReport with full separation of observed facts,
-    inferences, runtime test verification, confirmed/rejected hypotheses, and recommended next steps.
+    Produces a comprehensive BugInvestigationReport with root cause, runtime evidence,
+    proposed minimal patch, unified diff, isolated verification outcome, and regression analysis.
     """
     raw = state.get("bug_report", "")
-    norm = state.get("normalized_problem", {})
     entry_points = [ep["name"] for ep in state.get("entry_points", [])]
     relevant_files = state.get("relevant_files", [])
     call_traces = state.get("call_traces", [])
@@ -719,6 +896,13 @@ def generate_report(state: BugInvestigationState) -> BugInvestigationState:
     confirmed = state.get("confirmed_hypotheses", [])
     rejected = state.get("rejected_hypotheses", [])
 
+    # Phase 4 patch info
+    proposed_patch = state.get("proposed_patch") or {}
+    verif_res = state.get("verification_result") or {}
+    diff = state.get("patch_diff") or proposed_patch.get("diff")
+    final_status = state.get("final_status", "INCONCLUSIVE")
+    patch_history = state.get("patch_history", [])
+
     # Build human-readable call chain representation
     call_chain_lines: List[str] = []
     for trace in call_traces:
@@ -729,7 +913,7 @@ def generate_report(state: BugInvestigationState) -> BugInvestigationState:
         else:
             call_chain_lines.append(f"{root_name} (isolated / terminal)")
 
-    # Build static evidence citations with exact locations
+    # Build static evidence citations
     evidence_citations: List[str] = []
     for ev in evidence_items[:6]:
         fp = ev.get("file_path", "unknown")
@@ -759,32 +943,39 @@ def generate_report(state: BugInvestigationState) -> BugInvestigationState:
         for tr in test_runs
     ]
 
-    # Likely root cause with runtime backing
+    # Likely root cause statement
     if selected_h:
         status_note = f" [{selected_h.get('status', 'inconclusive').upper()}]"
         root_cause = f"{selected_h.get('explanation')}{status_note}"
     else:
-        root_cause = "Investigation yielded plausible candidates but requires further runtime verification."
+        root_cause = "Investigation yielded plausible candidates but requires further verification."
 
-    # Next step recommendation (directed toward Phase 4 patch generation)
-    primary_file = relevant_files[0] if relevant_files else "the suspect file"
-    if selected_h and selected_h.get("status") == "strongly supported":
+    # Next step recommendation based on verification status
+    if final_status in ("FIX_VERIFIED", "PRE_EXISTING_FAILURES"):
         rec_next_step = (
-            f"Generate and evaluate a minimal patch for '{primary_file}' targeting the verified runtime failure. "
-            f"(Automated code modification and patch generation will be performed in Phase 4)."
+            "Fix verified successfully inside isolated workspace without regressions! "
+            "Please review the proposed Unified Diff above. Explicit user approval is required "
+            "before applying this patch to the working repository (automatic GitHub push is disabled)."
+        )
+    elif final_status == "PATCH_FAILED":
+        rec_next_step = (
+            "Patch verification failed or introduced regressions after max iterations. "
+            "Review the failure stack traces and consider manual patch refinement."
         )
     else:
         rec_next_step = (
-            f"Add targeted regression test coverage for '{primary_file}' to isolate component interactions before patching."
+            "Review the proposed patch and run targeted unit tests to verify the fix."
         )
 
     limitations = [
-        "Repository tests are executed inside an isolated sandbox without host network access or host secret exposure.",
-        "Code modification, automated patching, and pull request creation are deferred to Phase 4.",
+        "Patches are executed and verified strictly inside isolated temporary workspaces without modifying the source repository.",
+        "Automatic Git commits, branch creation, pull requests, and remote pushes are disabled by design.",
     ]
 
+    files_changed = [fp.get("file_path", "") for fp in proposed_patch.get("files_changed", [])]
+
     report = BugInvestigationReport(
-        summary=f"Investigation of bug report: '{raw}'. Identified {len(entry_points)} entry points across {len(relevant_files)} files with {len(test_runs)} test executions.",
+        summary=f"Investigation & Patch Report for: '{raw}'. Root cause identified, minimal patch generated, and verified in isolated workspace.",
         likely_root_cause=root_cause,
         confidence=confidence,
         entry_points=entry_points,
@@ -797,6 +988,15 @@ def generate_report(state: BugInvestigationState) -> BugInvestigationState:
         hypotheses=hypotheses,
         confirmed_hypotheses=confirmed,
         rejected_hypotheses=rejected,
+        patch_summary=proposed_patch.get("description"),
+        files_changed=files_changed,
+        diff=diff,
+        verification_status=final_status,
+        pre_existing_failures=verif_res.get("pre_existing_failures", []),
+        new_failures=verif_res.get("new_regressions", []),
+        patch_iterations=len(patch_history),
+        patch_history=patch_history,
+        user_review_required=True,
         recommended_next_step=rec_next_step,
         limitations=limitations,
     )

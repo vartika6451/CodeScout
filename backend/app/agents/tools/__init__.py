@@ -13,6 +13,7 @@ from app.agents.tools.code_tools import (
     trace_function,
 )
 from app.agents.tools.execution_tools import run_tests
+from app.agents.tools.patch_tools import apply_and_verify_patch, propose_patch
 
 __all__ = [
     "clear_graph_cache",
@@ -28,5 +29,8 @@ __all__ = [
     "get_dependencies",
     "get_dependents",
     "run_tests",
+    "propose_patch",
+    "apply_and_verify_patch",
 ]
+
 
