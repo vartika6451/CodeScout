@@ -12,6 +12,7 @@ from app.agents.tools.code_tools import (
     search_code,
     trace_function,
 )
+from app.agents.tools.execution_tools import run_tests
 
 __all__ = [
     "clear_graph_cache",
@@ -26,4 +27,6 @@ __all__ = [
     "trace_function",
     "get_dependencies",
     "get_dependents",
+    "run_tests",
 ]
+

@@ -21,7 +21,7 @@ class NormalizedProblem:
 
 @dataclass
 class Hypothesis:
-    """A plausible root-cause explanation backed by supporting and contradicting evidence."""
+    """A plausible root-cause explanation backed by supporting, contradicting, and runtime evidence."""
 
     id: str  # e.g., 'H1', 'H2'
     title: str
@@ -31,6 +31,8 @@ class Hypothesis:
     relevant_files: List[str] = field(default_factory=list)
     relevant_symbols: List[str] = field(default_factory=list)
     confidence: float = 0.0  # Estimated confidence between 0.0 and 1.0
+    status: str = "inconclusive"  # 'strongly supported', 'supported', 'weakly supported', 'not supported', 'rejected', 'inconclusive'
+    runtime_evidence: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -38,7 +40,7 @@ class Hypothesis:
 
 @dataclass
 class BugInvestigationReport:
-    """Comprehensive, structured debugging report."""
+    """Comprehensive, structured debugging report with runtime verification."""
 
     summary: str
     likely_root_cause: str
@@ -47,7 +49,12 @@ class BugInvestigationReport:
     relevant_files: List[str] = field(default_factory=list)
     call_chain: List[str] = field(default_factory=list)
     evidence: List[str] = field(default_factory=list)
+    runtime_evidence: List[str] = field(default_factory=list)
+    tests_executed: List[str] = field(default_factory=list)
+    test_results: List[Dict[str, Any]] = field(default_factory=list)
     hypotheses: List[Dict[str, Any]] = field(default_factory=list)
+    confirmed_hypotheses: List[str] = field(default_factory=list)
+    rejected_hypotheses: List[str] = field(default_factory=list)
     recommended_next_step: str = ""
     limitations: List[str] = field(default_factory=list)
 
@@ -72,6 +79,15 @@ class BugInvestigationState(TypedDict, total=False):
     relevant_symbols: List[str]
     call_traces: List[Dict[str, Any]]
 
+    # Runtime verification & execution state
+    test_runs: List[Dict[str, Any]]
+    runtime_evidence: List[Dict[str, Any]]
+    failures: List[Dict[str, Any]]
+    confirmed_hypotheses: List[str]
+    rejected_hypotheses: List[str]
+    test_count: int
+    total_test_runtime: float
+
     hypotheses: List[Dict[str, Any]]
     selected_hypothesis: Optional[Dict[str, Any]]
     confidence: str
@@ -81,3 +97,4 @@ class BugInvestigationState(TypedDict, total=False):
     is_conclusive: bool
 
     final_report: Dict[str, Any]
+

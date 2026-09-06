@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from dotenv import load_dotenv
@@ -18,14 +19,21 @@ from app.agents.tools import (
     find_definition,
     get_file_structure,
     get_repository_graph,
+    run_tests,
     search_code,
     trace_function,
 )
+from app.execution.executor import ExecutionService
+from app.execution.models import ExecutionStatus
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 MAX_INVESTIGATION_STEPS = 6
+MAX_TEST_RUNS = 3
+MAX_TOTAL_TEST_RUNTIME = 180.0
+PER_TEST_TIMEOUT = 60.0
+
 
 
 # ==============================================================================
@@ -112,6 +120,13 @@ def understand_bug(state: BugInvestigationState) -> BugInvestigationState:
         "relevant_symbols": [],
         "call_traces": [],
         "hypotheses": [],
+        "test_runs": [],
+        "runtime_evidence": [],
+        "failures": [],
+        "confirmed_hypotheses": [],
+        "rejected_hypotheses": [],
+        "test_count": 0,
+        "total_test_runtime": 0.0,
         "investigation_steps": [],
         "step_count": 0,
         "is_conclusive": False,
@@ -344,10 +359,10 @@ def generate_hypotheses(state: BugInvestigationState) -> BugInvestigationState:
     # Hypothesis 2: Missing or invalid parameter in request payload
     h2 = Hypothesis(
         id="H2",
-        title="Invalid Request Payload or Missing Required Fields",
+        title="Invalid Request Payload, NoneType Value, or Missing Required Fields",
         explanation=(
-            "The client provided an unexpected request format or missing field, triggering a validation error "
-            "or an unhandled KeyError/ValueError during input parsing."
+            "The client provided an unexpected request format, NoneType value, or missing field, "
+            "triggering a validation error or an unhandled TypeError/KeyError/ValueError during parsing or attribute access."
         ),
         supporting_evidence=[
             f"Entry point receives request payload model in {observed_files_str}."
@@ -357,7 +372,7 @@ def generate_hypotheses(state: BugInvestigationState) -> BugInvestigationState:
         ],
         relevant_files=relevant_files[:1],
         relevant_symbols=relevant_symbols[:2],
-        confidence=0.35,
+        confidence=0.70 if ("typeerror" in raw.lower() or "keyerror" in raw.lower()) else 0.35,
     )
     hypotheses.append(h2.to_dict())
 
@@ -393,40 +408,289 @@ def generate_hypotheses(state: BugInvestigationState) -> BugInvestigationState:
 
 
 # ==============================================================================
-# Step 6: Evaluate Hypotheses
+# Step 6: Controlled Test Execution & Verification (Phase 3 Part 2)
 # ==============================================================================
-def evaluate_hypotheses(state: BugInvestigationState) -> BugInvestigationState:
-    """Evaluates competing hypotheses and decides if the investigation is conclusive."""
-    hypotheses = state.get("hypotheses", [])
-    step_count = state.get("step_count", 0)
+def execute_test_verification(state: BugInvestigationState) -> BugInvestigationState:
+    """
+    Executes relevant repository tests inside the isolated execution sandbox to verify hypotheses.
+    Enforces resource, timeout, output, and execution count limits.
+    """
+    repo_path = state.get("repo_path")
+    test_count = state.get("test_count", 0)
+    total_runtime = state.get("total_test_runtime", 0.0)
+    test_runs = list(state.get("test_runs", []))
+    failures = list(state.get("failures", []))
+    runtime_evidence = list(state.get("runtime_evidence", []))
 
-    # Rank hypotheses by confidence
-    sorted_hypotheses = sorted(hypotheses, key=lambda h: h.get("confidence", 0.0), reverse=True)
-    selected = sorted_hypotheses[0] if sorted_hypotheses else None
+    # Guard: check execution limits
+    if test_count >= MAX_TEST_RUNS:
+        logger.info(f"Reached MAX_TEST_RUNS ({MAX_TEST_RUNS}); skipping further test execution.")
+        return state
 
-    # Confidence rating
-    conf_val = selected.get("confidence", 0.0) if selected else 0.0
-    if conf_val >= 0.7:
-        confidence_rating = "High"
-    elif conf_val >= 0.4:
-        confidence_rating = "Medium"
-    else:
-        confidence_rating = "Low"
+    if total_runtime >= MAX_TOTAL_TEST_RUNTIME:
+        logger.info(f"Reached MAX_TOTAL_TEST_RUNTIME ({MAX_TOTAL_TEST_RUNTIME}s); skipping further tests.")
+        return state
 
-    # Conclusive if confidence is high or if step limit reached
-    is_conclusive = step_count >= MAX_INVESTIGATION_STEPS or conf_val >= 0.65
+    # Discover candidate tests prioritized by relevance to suspect symbols & files
+    service = ExecutionService()
+    candidate_tests = service.find_candidate_tests(
+        repo_path=repo_path or ".",
+        symbols=state.get("relevant_symbols", []),
+        files=state.get("relevant_files", []),
+    )
+
+    already_run_targets = {tr.get("target") for tr in test_runs}
+    target_to_run = None
+
+    for cand in candidate_tests:
+        if cand not in already_run_targets:
+            target_to_run = cand
+            break
+
+    # If no specific candidate test found and no test run yet, run default suite
+    if target_to_run is None and not test_runs and candidate_tests:
+        target_to_run = candidate_tests[0]
+
+    if not candidate_tests:
+        # No tests exist in this repository
+        step_info = {
+            "action": "execute_test_verification",
+            "executed": False,
+            "reason": "No test files detected in repository.",
+        }
+        return {
+            **state,
+            "investigation_steps": state.get("investigation_steps", []) + [step_info],
+            "step_count": state.get("step_count", 0) + 1,
+        }
+
+    # Execute targeted test in sandbox
+    run_result = run_tests(
+        test_target=target_to_run,
+        repo_path=repo_path,
+        timeout=PER_TEST_TIMEOUT,
+    )
+
+    test_runs.append(run_result)
+    new_runtime = total_runtime + run_result.get("duration", 0.0)
+    new_test_count = test_count + 1
+
+    # Record parsed failures
+    for f in run_result.get("failures", []):
+        failures.append(f)
+        runtime_evidence.append({
+            "type": "test_failure",
+            "test_name": f.get("test_name"),
+            "exception_type": f.get("exception_type"),
+            "error_message": f.get("error_message"),
+            "file_path": f.get("file_path"),
+            "line_number": f.get("line_number"),
+            "is_environment_error": f.get("is_environment_error", False),
+            "description": f"Test '{f.get('test_name')}' failed: {f.get('exception_type')}: {f.get('error_message')} at {f.get('file_path')}:{f.get('line_number')}",
+        })
+
+    if run_result.get("status") == ExecutionStatus.SUCCESS.value:
+        runtime_evidence.append({
+            "type": "test_pass",
+            "test_name": target_to_run,
+            "description": f"Targeted test '{target_to_run}' executed and passed cleanly.",
+        })
+    elif run_result.get("status") == ExecutionStatus.TIMEOUT.value:
+        runtime_evidence.append({
+            "type": "timeout",
+            "test_name": target_to_run,
+            "description": f"Test '{target_to_run}' timed out after {PER_TEST_TIMEOUT}s.",
+        })
+    elif run_result.get("status") == ExecutionStatus.ENVIRONMENT_ERROR.value:
+        runtime_evidence.append({
+            "type": "environment_error",
+            "test_name": target_to_run,
+            "description": f"Environment setup failure: {run_result.get('error_summary')}",
+        })
 
     step_info = {
-        "action": "evaluate_hypotheses",
-        "selected_hypothesis": selected.get("id") if selected else None,
-        "confidence": confidence_rating,
-        "is_conclusive": is_conclusive,
+        "action": "execute_test_verification",
+        "executed": True,
+        "target": target_to_run,
+        "status": run_result.get("status"),
+        "duration": run_result.get("duration"),
+        "failures_detected": len(run_result.get("failures", [])),
     }
 
     return {
         **state,
+        "test_runs": test_runs,
+        "failures": failures,
+        "runtime_evidence": runtime_evidence,
+        "test_count": new_test_count,
+        "total_test_runtime": new_runtime,
+        "investigation_steps": state.get("investigation_steps", []) + [step_info],
+        "step_count": state.get("step_count", 0) + 1,
+    }
+
+
+# ==============================================================================
+# Step 7: Analyze Runtime Failures
+# ==============================================================================
+def analyze_runtime_failures(state: BugInvestigationState) -> BugInvestigationState:
+    """
+    Analyzes captured runtime output and separates application code bugs from
+    crashes, timeouts, and environment setup errors.
+    """
+    failures = state.get("failures", [])
+    test_runs = state.get("test_runs", [])
+
+    has_env_error = any(f.get("is_environment_error", False) for f in failures) or any(
+        tr.get("status") == ExecutionStatus.ENVIRONMENT_ERROR.value for tr in test_runs
+    )
+    has_timeout = any(tr.get("status") == ExecutionStatus.TIMEOUT.value for tr in test_runs)
+    has_test_failure = any(
+        tr.get("status") == ExecutionStatus.FAILED.value and not f.get("is_environment_error", False)
+        for tr in test_runs
+        for f in tr.get("failures", [])
+    )
+
+    step_info = {
+        "action": "analyze_runtime_failures",
+        "has_test_failure": has_test_failure,
+        "has_timeout": has_timeout,
+        "has_env_error": has_env_error,
+        "failure_count": len(failures),
+    }
+
+    return {
+        **state,
+        "investigation_steps": state.get("investigation_steps", []) + [step_info],
+        "step_count": state.get("step_count", 0) + 1,
+    }
+
+
+# ==============================================================================
+# Step 8: Evaluate Hypotheses (Static + Runtime Evidence)
+# ==============================================================================
+def evaluate_hypotheses(state: BugInvestigationState) -> BugInvestigationState:
+    """
+    Evaluates competing hypotheses by integrating both static CodeGraph evidence
+    and runtime test execution evidence, updating status to supported/rejected.
+    """
+    hypotheses = list(state.get("hypotheses", []))
+    step_count = state.get("step_count", 0)
+    failures = state.get("failures", [])
+    test_runs = state.get("test_runs", [])
+    runtime_evidence = state.get("runtime_evidence", [])
+
+    confirmed_ids: List[str] = []
+    rejected_ids: List[str] = []
+
+    has_env_error = any(f.get("is_environment_error", False) for f in failures) or any(
+        tr.get("status") == ExecutionStatus.ENVIRONMENT_ERROR.value for tr in test_runs
+    )
+
+    for h in hypotheses:
+        h_text = f"{h.get('title', '')} {h.get('explanation', '')} {' '.join(h.get('relevant_files', []))}".lower()
+
+        if has_env_error:
+            # Environment error should NOT falsely convict application code
+            h["status"] = "inconclusive"
+            h.setdefault("runtime_evidence", []).append(
+                "Test execution encountered an environment or dependency setup failure; cannot verify hypothesis."
+            )
+            continue
+
+        matched_failure = False
+        contradicted = False
+
+        for f in failures:
+            exc = f.get("exception_type", "").lower()
+            msg = f.get("error_message", "").lower()
+            fp = (f.get("file_path") or "").lower()
+
+            exc_stem = exc.replace("error", "").replace("exception", "").strip()
+            has_exc_match = (
+                (bool(exc) and exc in h_text)
+                or (len(exc_stem) >= 3 and exc_stem in h_text)
+            )
+            has_msg_words = [w for w in re.findall(r"\w+", msg) if len(w) > 3]
+            has_msg_match = bool(has_msg_words and any(w.lower() in h_text for w in has_msg_words))
+            has_file_match = bool(
+                fp and any(len(Path(fp).stem) > 2 and Path(fp).stem in rf.lower() for rf in h.get("relevant_files", []))
+            )
+
+            is_external_hypothesis = any(
+                ext in h_text for ext in ("database", "external dependency", "rest api", "network", "timeout")
+            )
+            is_internal_error = exc in (
+                "typeerror", "keyerror", "attributeerror", "indexerror", "assertionerror", "valueerror"
+            )
+
+            if has_exc_match or (has_file_match and has_msg_match):
+                matched_failure = True
+                h.setdefault("runtime_evidence", []).append(
+                    f"Confirmed by runtime failure in {f.get('file_path')}:{f.get('line_number')} ({f.get('exception_type')}: {f.get('error_message')})"
+                )
+            elif is_external_hypothesis and is_internal_error:
+                contradicted = True
+            else:
+                contradicted = True
+
+        if matched_failure:
+            h["status"] = "strongly supported"
+            h["confidence"] = min(0.95, max(h.get("confidence", 0.0), 0.88))
+            confirmed_ids.append(h["id"])
+        elif contradicted:
+            h["status"] = "rejected"
+            h["confidence"] = min(h.get("confidence", 0.0), 0.15)
+            h.setdefault("runtime_evidence", []).append(
+                "Contradicted by runtime execution: observed failure originated from an unrelated component or exception type."
+            )
+            rejected_ids.append(h["id"])
+        elif test_runs and any(tr.get("status") == ExecutionStatus.SUCCESS.value for tr in test_runs):
+            # Target test passed
+            h["status"] = "weakly supported"
+            h["confidence"] = min(h.get("confidence", 0.0), 0.35)
+        else:
+            # No matching runtime confirmation
+            if not test_runs:
+                h["status"] = "inconclusive"
+            else:
+                h["status"] = "not supported"
+                rejected_ids.append(h["id"])
+
+    # Rank hypotheses by updated confidence
+    sorted_hypotheses = sorted(hypotheses, key=lambda x: x.get("confidence", 0.0), reverse=True)
+    selected = sorted_hypotheses[0] if sorted_hypotheses else None
+
+    conf_val = selected.get("confidence", 0.0) if selected else 0.0
+    if conf_val >= 0.75:
+        confidence_rating = "High"
+    elif conf_val >= 0.40:
+        confidence_rating = "Medium"
+    else:
+        confidence_rating = "Low"
+
+    is_conclusive = (
+        step_count >= MAX_INVESTIGATION_STEPS
+        or len(test_runs) >= MAX_TEST_RUNS
+        or (selected and selected.get("status") == "strongly supported")
+    )
+
+    step_info = {
+        "action": "evaluate_hypotheses",
+        "selected_hypothesis": selected.get("id") if selected else None,
+        "selected_status": selected.get("status") if selected else "inconclusive",
+        "confidence": confidence_rating,
+        "is_conclusive": is_conclusive,
+        "confirmed_count": len(confirmed_ids),
+        "rejected_count": len(rejected_ids),
+    }
+
+    return {
+        **state,
+        "hypotheses": hypotheses,
         "selected_hypothesis": selected,
         "confidence": confidence_rating,
+        "confirmed_hypotheses": confirmed_ids,
+        "rejected_hypotheses": rejected_ids,
         "is_conclusive": is_conclusive,
         "investigation_steps": state.get("investigation_steps", []) + [step_info],
         "step_count": step_count + 1,
@@ -434,10 +698,13 @@ def evaluate_hypotheses(state: BugInvestigationState) -> BugInvestigationState:
 
 
 # ==============================================================================
-# Step 7: Generate Final Investigation Report
+# Step 9: Generate Final Investigation Report (Phase 3 Part 2)
 # ==============================================================================
 def generate_report(state: BugInvestigationState) -> BugInvestigationState:
-    """Produces a reasoned BugInvestigationReport with clear separation of observed facts, inferences, and recommendations."""
+    """
+    Produces a comprehensive BugInvestigationReport with full separation of observed facts,
+    inferences, runtime test verification, confirmed/rejected hypotheses, and recommended next steps.
+    """
     raw = state.get("bug_report", "")
     norm = state.get("normalized_problem", {})
     entry_points = [ep["name"] for ep in state.get("entry_points", [])]
@@ -447,6 +714,10 @@ def generate_report(state: BugInvestigationState) -> BugInvestigationState:
     hypotheses = state.get("hypotheses", [])
     selected_h = state.get("selected_hypothesis", {})
     confidence = state.get("confidence", "Medium")
+    test_runs = state.get("test_runs", [])
+    runtime_evidence_items = state.get("runtime_evidence", [])
+    confirmed = state.get("confirmed_hypotheses", [])
+    rejected = state.get("rejected_hypotheses", [])
 
     # Build human-readable call chain representation
     call_chain_lines: List[str] = []
@@ -458,7 +729,7 @@ def generate_report(state: BugInvestigationState) -> BugInvestigationState:
         else:
             call_chain_lines.append(f"{root_name} (isolated / terminal)")
 
-    # Build evidence citations with exact locations
+    # Build static evidence citations with exact locations
     evidence_citations: List[str] = []
     for ev in evidence_items[:6]:
         fp = ev.get("file_path", "unknown")
@@ -466,35 +737,66 @@ def generate_report(state: BugInvestigationState) -> BugInvestigationState:
         desc = ev.get("description", "")
         evidence_citations.append(f"[{ev.get('type', 'observed').upper()}] {fp}:{line} - {desc}")
 
-    # Root cause statement
-    root_cause = (
-        selected_h.get("explanation", f"Suspicious failure point in {', '.join(entry_points or ['codebase'])}.")
-        if selected_h
-        else "Investigation yielded plausible candidates but requires runtime validation."
-    )
+    # Build runtime evidence citations
+    runtime_citations: List[str] = []
+    for rev in runtime_evidence_items:
+        runtime_citations.append(rev.get("description", str(rev)))
 
-    # Next step recommendation (directed toward Phase 3 Part 2 test execution)
-    ep_name = entry_points[0] if entry_points else "the target function"
-    primary_file = relevant_files[0] if relevant_files else "the target file"
-    rec_next_step = (
-        f"Create and run a targeted test case for '{ep_name}' in '{primary_file}' "
-        f"mocking failure conditions (e.g. timeout or exception) to inspect the runtime stack trace."
-    )
+    # Tests executed summary
+    tests_executed = [
+        f"{tr.get('command', 'test')} (exit: {tr.get('exit_code')}, {tr.get('duration')}s, status: {tr.get('status')})"
+        for tr in test_runs
+    ]
+
+    test_results_summary = [
+        {
+            "target": tr.get("target"),
+            "status": tr.get("status"),
+            "exit_code": tr.get("exit_code"),
+            "duration": tr.get("duration"),
+            "failure_count": len(tr.get("failures", [])),
+        }
+        for tr in test_runs
+    ]
+
+    # Likely root cause with runtime backing
+    if selected_h:
+        status_note = f" [{selected_h.get('status', 'inconclusive').upper()}]"
+        root_cause = f"{selected_h.get('explanation')}{status_note}"
+    else:
+        root_cause = "Investigation yielded plausible candidates but requires further runtime verification."
+
+    # Next step recommendation (directed toward Phase 4 patch generation)
+    primary_file = relevant_files[0] if relevant_files else "the suspect file"
+    if selected_h and selected_h.get("status") == "strongly supported":
+        rec_next_step = (
+            f"Generate and evaluate a minimal patch for '{primary_file}' targeting the verified runtime failure. "
+            f"(Automated code modification and patch generation will be performed in Phase 4)."
+        )
+    else:
+        rec_next_step = (
+            f"Add targeted regression test coverage for '{primary_file}' to isolate component interactions before patching."
+        )
 
     limitations = [
-        "Static code graph and semantic RAG analysis cannot definitively verify runtime network or database responses without test execution.",
-        "Phase 3 Part 1 performs static investigation; live error replication will occur in Phase 3 Part 2.",
+        "Repository tests are executed inside an isolated sandbox without host network access or host secret exposure.",
+        "Code modification, automated patching, and pull request creation are deferred to Phase 4.",
     ]
 
     report = BugInvestigationReport(
-        summary=f"Investigation of bug report: '{raw}'. Identified {len(entry_points)} entry points across {len(relevant_files)} relevant files.",
+        summary=f"Investigation of bug report: '{raw}'. Identified {len(entry_points)} entry points across {len(relevant_files)} files with {len(test_runs)} test executions.",
         likely_root_cause=root_cause,
         confidence=confidence,
         entry_points=entry_points,
         relevant_files=relevant_files,
         call_chain=call_chain_lines,
         evidence=evidence_citations,
+        runtime_evidence=runtime_citations,
+        tests_executed=tests_executed,
+        test_results=test_results_summary,
         hypotheses=hypotheses,
+        confirmed_hypotheses=confirmed,
+        rejected_hypotheses=rejected,
         recommended_next_step=rec_next_step,
         limitations=limitations,
     )
