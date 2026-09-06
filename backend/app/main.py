@@ -5,6 +5,7 @@ from app.routes import health
 from app.routes import analyze
 from app.routes import chat
 from app.routes import repositories
+from app.routes import investigate
 
 
 app = FastAPI(
@@ -32,3 +33,4 @@ app.include_router(health.router)
 app.include_router(analyze.router)
 app.include_router(chat.router)
 app.include_router(repositories.router)
+app.include_router(investigate.router)
