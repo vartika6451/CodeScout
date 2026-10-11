@@ -25,6 +25,7 @@ interface ChatWorkspaceProps {
   selectedRepo: string;
   repositories: Repository[];
   onOpenAnalyzer: () => void;
+  initialQuery?: string;
 }
 
 export default function ChatWorkspace({
@@ -32,6 +33,7 @@ export default function ChatWorkspace({
   selectedRepo,
   repositories,
   onOpenAnalyzer,
+  initialQuery,
 }: ChatWorkspaceProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -39,15 +41,23 @@ export default function ChatWorkspace({
   const [selectedCitation, setSelectedCitation] = useState<SourceCitation | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const hasTriggeredInitial = useRef(false);
 
   const sampleQuestions = [
     "Where is authentication and route protection implemented?",
     "Explain the overall project architecture and key components.",
-    "What third-party APIs or payment integrations are used?",
+    "What third-party APIs or database models are used?",
     "How does the state management or data flow work?",
   ];
 
   const currentRepoObj = repositories.find((r) => r.repository === selectedRepo);
+
+  useEffect(() => {
+    if (initialQuery && !hasTriggeredInitial.current && selectedRepo) {
+      hasTriggeredInitial.current = true;
+      handleSend(initialQuery);
+    }
+  }, [initialQuery, selectedRepo]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
